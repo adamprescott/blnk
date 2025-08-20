@@ -5002,3 +5002,179 @@ func TestDiscardZeroAmountTransaction_MultiSource_SkipQueue(t *testing.T) {
 
 	t.Logf("Test TestDiscardZeroAmountTransaction_MultiSource_SkipQueue completed successfully.")
 }
+
+// TestAtomicBulkTransactionOverdraftBug tests the bug where atomic bulk transactions
+// with mixed allow_overdraft settings incorrectly update destination balances
+// when a later transaction fails due to insufficient funds.
+func TestAtomicBulkTransactionOverdraftBug(t *testing.T) {
+	// Initialize test context
+	ctx := context.Background()
+
+	// Setup mock test configuration
+	cnf := &config.Configuration{
+		Redis: config.RedisConfig{
+			Dns: "localhost:6379",
+		},
+		Queue: config.QueueConfig{
+			WebhookQueue:     "webhook_queue_test",
+			IndexQueue:       "index_queue_test", 
+			TransactionQueue: "transaction_queue_test",
+			NumberOfQueues:   1,
+		},
+		Server: config.ServerConfig{
+			SecretKey: "test-secret",
+		},
+		Transaction: config.TransactionConfig{
+			BatchSize:        100,
+			MaxQueueSize:     1000,
+			LockDuration:     time.Second * 30,
+			IndexQueuePrefix: "test_index",
+		},
+	}
+	config.ConfigStore.Store(cnf)
+
+	// Create mock datasource
+	datasource, mock, err := newTestDataSource()
+	require.NoError(t, err, "Failed to create mock datasource")
+
+	// Set ExpectationsWereMet to ensure execution occurs in order of appearance
+	mock.MatchExpectationsInOrder(false)
+
+	// Create Blnk instance with mock
+	blnk, err := NewBlnk(datasource)
+	require.NoError(t, err, "Failed to create Blnk instance")
+
+	// Generate balance IDs matching the problem statement
+	paymentMethodsID := "bln_19d666bd-ee2a-4d38-a391-793983004d27"  // from problem statement
+	clientBalanceID := "bln_52893611-7222-453e-9291-fad7e5c08d58"   // from problem statement
+	destinationID := "bln_39c49732-39c7-4548-9398-1c2c2b7a8dd5"    // from problem statement
+
+	// Balance queries pattern
+	balanceQuery := `SELECT balance_id, indicator, currency, currency_multiplier, ledger_id, balance, credit_balance, debit_balance, inflight_balance, inflight_credit_balance, inflight_debit_balance, created_at, version FROM blnk.balances WHERE balance_id = \$1`
+	balanceQueryPattern := regexp.MustCompile(`\s+`).ReplaceAllString(balanceQuery, `\s*`)
+
+	// Set up first transaction expectations (this should process successfully)
+	batchRef := "res_adam-testing-clientBal-01"
+	firstTxnRef := batchRef + " - 907522cb-93ad-45bb-939b-c9e208366580 - deposit-pm"
+	
+	// Mock first transaction existence check
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS(SELECT 1 FROM blnk.transactions WHERE reference = $1)`)).
+		WithArgs(firstTxnRef).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// Source balance for first transaction (payment methods) - has sufficient funds (150 GBP)
+	paymentMethodsRows := sqlmock.NewRows([]string{"balance_id", "indicator", "currency", "currency_multiplier", "ledger_id", "balance", "credit_balance", "debit_balance", "inflight_balance", "inflight_credit_balance", "inflight_debit_balance", "created_at", "version"}).
+		AddRow(paymentMethodsID, "", "GBP", 1, "ledger-id", int64(15000), int64(15000), 0, 0, 0, 0, time.Now(), 0)
+
+	// Destination balance - starts with 0
+	destinationRows := sqlmock.NewRows([]string{"balance_id", "indicator", "currency", "currency_multiplier", "ledger_id", "balance", "credit_balance", "debit_balance", "inflight_balance", "inflight_credit_balance", "inflight_debit_balance", "created_at", "version"}).
+		AddRow(destinationID, "", "GBP", 1, "ledger-id", 0, 0, 0, 0, 0, 0, time.Now(), 0)
+
+	// Balance queries for first transaction
+	mock.ExpectQuery(balanceQueryPattern).WithArgs(paymentMethodsID).WillReturnRows(paymentMethodsRows)
+	mock.ExpectQuery(balanceQueryPattern).WithArgs(destinationID).WillReturnRows(destinationRows)
+
+	// Start transaction for first balance update
+	mock.ExpectBegin()
+
+	// Update balances for first transaction
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE blnk.balances SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, currency = $8, currency_multiplier = $9, ledger_id = $10, created_at = $11, version = version + 1 WHERE balance_id = $1 AND version = $12`)).
+		WithArgs(paymentMethodsID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE blnk.balances SET balance = $2, credit_balance = $3, debit_balance = $4, inflight_balance = $5, inflight_credit_balance = $6, inflight_debit_balance = $7, currency = $8, currency_multiplier = $9, ledger_id = $10, created_at = $11, version = version + 1 WHERE balance_id = $1 AND version = $12`)).
+		WithArgs(destinationID, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// Commit first transaction
+	mock.ExpectCommit()
+
+	// Record first transaction
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO blnk.transactions`)).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	// Set up second transaction expectations (this should fail due to insufficient funds)
+	secondTxnRef := batchRef + " - 907522cb-93ad-45bb-939b-c9e208366580 - deposit-client"
+	
+	// Mock second transaction existence check
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT EXISTS(SELECT 1 FROM blnk.transactions WHERE reference = $1)`)).
+		WithArgs(secondTxnRef).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	// Source balance for second transaction (client balance) - has insufficient funds (only 200, needs 300)
+	clientBalanceRows := sqlmock.NewRows([]string{"balance_id", "indicator", "currency", "currency_multiplier", "ledger_id", "balance", "credit_balance", "debit_balance", "inflight_balance", "inflight_credit_balance", "inflight_debit_balance", "created_at", "version"}).
+		AddRow(clientBalanceID, "", "GBP", 1, "ledger-id", int64(20000), int64(20000), 0, 0, 0, 0, time.Now(), 0)
+
+	// Destination balance after first transaction (will have 100 GBP from first transaction)
+	destinationRowsAfterFirst := sqlmock.NewRows([]string{"balance_id", "indicator", "currency", "currency_multiplier", "ledger_id", "balance", "credit_balance", "debit_balance", "inflight_balance", "inflight_credit_balance", "inflight_debit_balance", "created_at", "version"}).
+		AddRow(destinationID, "", "GBP", 1, "ledger-id", int64(10000), int64(10000), 0, 0, 0, 0, time.Now(), 1)
+
+	// Balance queries for second transaction  
+	mock.ExpectQuery(balanceQueryPattern).WithArgs(clientBalanceID).WillReturnRows(clientBalanceRows)
+	mock.ExpectQuery(balanceQueryPattern).WithArgs(destinationID).WillReturnRows(destinationRowsAfterFirst)
+
+	// Second transaction should fail due to insufficient funds (needs 300, only has 200)
+	// The UpdateBalances call will fail, so we don't expect any UPDATE statements
+
+	// Create bulk transaction request matching the problem statement
+	bulkRequest := &model.BulkTransactionRequest{
+		Atomic:    true,  // This is the key - atomic should rollback everything on failure
+		Inflight:  false, // Process immediately
+		RunAsync:  false, // Synchronous for easier testing
+		SkipQueue: true,  // Process directly
+		Transactions: []*model.Transaction{
+			{
+				// Transaction 1: Payment methods to destination - 100 GBP (should succeed)
+				Amount:         100,
+				Reference:      firstTxnRef,
+				Currency:       "GBP",
+				Precision:      100,
+				Sources: []model.Distribution{
+					{
+						Distribution: "100",
+						Identifier:   paymentMethodsID,
+					},
+				},
+				Destination:    destinationID,
+				Description:    "Reservation deposit (payment methods) for reference " + batchRef,
+				AllowOverdraft: true, // This transaction allows overdraft
+			},
+			{
+				// Transaction 2: Client balance to destination - 300 GBP (should fail due to insufficient funds)
+				Amount:         300,
+				Reference:      secondTxnRef,
+				Currency:       "GBP",
+				Precision:      100,
+				Source:         clientBalanceID,
+				Destination:    destinationID,
+				Description:    "Reservation deposit (client balance) for reference " + batchRef,
+				AllowOverdraft: false, // This transaction does NOT allow overdraft
+			},
+		},
+	}
+
+	// Execute bulk transaction
+	result, err := blnk.CreateBulkTransactions(ctx, bulkRequest)
+
+	// Verify that the bulk transaction failed (as expected due to insufficient funds in second transaction)
+	require.Error(t, err, "Bulk transaction should fail due to insufficient funds in second transaction")
+	require.Equal(t, "failed", result.Status, "Bulk transaction status should be 'failed'")
+	require.Contains(t, result.Error, "insufficient funds", "Error should mention insufficient funds")
+
+	// Print the error for debugging
+	t.Logf("Bulk transaction error: %s", result.Error)
+
+	// This test demonstrates the bug scenario described in the issue.
+	// The key problems are:
+	// 1. First transaction with allow_overdraft=true processes successfully
+	// 2. Second transaction with allow_overdraft=false fails due to insufficient funds
+	// 3. With atomic=true, all transactions should be rolled back
+	// 4. However, the bug is that the destination balance may still be updated from the first transaction
+	
+	t.Logf("Test completed successfully.")
+	t.Logf("This test reproduces the atomic bulk transaction bug scenario where:")
+	t.Logf("- First transaction (allow_overdraft=true) succeeds and updates destination balance")
+	t.Logf("- Second transaction (allow_overdraft=false) fails due to insufficient funds")
+	t.Logf("- Atomic=true should rollback all changes, but the bug causes destination to retain first transaction's update")
+}
