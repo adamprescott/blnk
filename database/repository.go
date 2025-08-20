@@ -57,6 +57,15 @@ type transaction interface {
 	TransactionExistsByIDOrParentID(ctx context.Context, id string) (bool, error)
 	GetTransactionsByParent(ctx context.Context, parentID string, limit int, offset int64) ([]*model.Transaction, error) // Retrieves transactions by parent ID with pagination
 	IsTransactionRefunded(ctx context.Context, transaction *model.Transaction) (bool, error)                             // Checks if a transaction has already been refunded
+	BeginAtomicTx(ctx context.Context) (AtomicTransaction, error)                                                         // Begins an atomic transaction
+}
+
+// AtomicTransaction defines methods for handling atomic database transactions
+type AtomicTransaction interface {
+	UpdateBalance(ctx context.Context, balance *model.Balance) error   // Updates a balance within the atomic transaction
+	PersistTransaction(ctx context.Context, txn *model.Transaction) error // Persists a transaction within the atomic transaction
+	Commit() error                                                       // Commits the atomic transaction
+	Rollback() error                                                     // Rolls back the atomic transaction
 }
 
 // ledger defines methods for handling ledgers.
