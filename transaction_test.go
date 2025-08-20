@@ -5139,12 +5139,7 @@ func TestAtomicBulkTransactionOverdraftBug(t *testing.T) {
 				Reference:      firstTxnRef,
 				Currency:       "GBP",
 				Precision:      100,
-				Sources: []model.Distribution{
-					{
-						Distribution: "100",
-						Identifier:   pmBalance.BalanceID,
-					},
-				},
+				Source:         pmBalance.BalanceID,
 				Destination:    destBalance.BalanceID,
 				Description:    "Reservation deposit (payment methods) for reference " + batchRef,
 				AllowOverdraft: true, // This transaction allows overdraft
