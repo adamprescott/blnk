@@ -5002,3 +5002,234 @@ func TestDiscardZeroAmountTransaction_MultiSource_SkipQueue(t *testing.T) {
 
 	t.Logf("Test TestDiscardZeroAmountTransaction_MultiSource_SkipQueue completed successfully.")
 }
+
+// TestAtomicBulkTransactionOverdraftBug tests the bug where atomic bulk transactions
+// with mixed allow_overdraft settings incorrectly update destination balances
+// when a later transaction fails due to insufficient funds.
+//
+// This test reproduces the exact issue described in the GitHub issue:
+// When performing an atomic bulk transaction, if one of the transactions has 
+// "allow_overdraft": false and it's below a transaction that has "allow_overdraft": true,
+// the destination balance is still updated with the transaction with an overdraft.
+func TestAtomicBulkTransactionOverdraftBug(t *testing.T) {
+	// Skip in short mode as this requires database setup
+	if testing.Short() {
+		t.Skip("Skipping atomic bulk transaction bug test in short mode")
+	}
+
+	ctx := context.Background()
+
+	t.Log("=== Atomic Bulk Transaction Overdraft Bug Reproduction Test ===")
+	t.Log("")
+	t.Log("This test reproduces the actual bug scenario with real database connections.")
+	t.Log("It demonstrates the issue where atomic=true doesn't properly rollback all")
+	t.Log("transactions when a later transaction fails due to insufficient funds.")
+	t.Log("")
+
+	// Setup test configuration with real database
+	cnf := &config.Configuration{
+		Redis: config.RedisConfig{
+			Dns: "localhost:6379",
+		},
+		DataSource: config.DataSourceConfig{
+			Dns: "postgres://postgres:password@localhost:5432/blnk?sslmode=disable",
+		},
+		Queue: config.QueueConfig{
+			WebhookQueue:     "webhook_queue_test_atomic_bug",
+			IndexQueue:       "index_queue_test_atomic_bug",
+			TransactionQueue: "transaction_queue_test_atomic_bug",
+			NumberOfQueues:   1,
+		},
+		Server: config.ServerConfig{
+			SecretKey: "test-secret-atomic-bug",
+		},
+		Transaction: config.TransactionConfig{
+			BatchSize:        100,
+			MaxQueueSize:     1000,
+			LockDuration:     time.Second * 30,
+			IndexQueuePrefix: "test_index_atomic_bug",
+		},
+	}
+	config.ConfigStore.Store(cnf)
+
+	// Create real datasource connection
+	ds, err := database.NewDataSource(cnf)
+	require.NoError(t, err, "Failed to create datasource")
+
+	// Create Blnk instance
+	blnk, err := NewBlnk(ds)
+	require.NoError(t, err, "Failed to create Blnk instance")
+
+	// Create test balances to match the issue scenario
+	// Payment methods balance with sufficient funds (150 GBP)
+	paymentMethodsBalance := &model.Balance{
+		BalanceID: model.GenerateUUIDWithSuffix("pm"),
+		Currency:  "GBP",
+		LedgerID:  "general_ledger_id",
+	}
+	pmBalance, err := ds.CreateBalance(*paymentMethodsBalance)
+	require.NoError(t, err, "Failed to create payment methods balance")
+
+	// Client balance with insufficient funds (200 GBP - not enough for 300 GBP transaction)
+	clientBalance := &model.Balance{
+		BalanceID: model.GenerateUUIDWithSuffix("client"),
+		Currency:  "GBP",
+		LedgerID:  "general_ledger_id",
+	}
+	clBalance, err := ds.CreateBalance(*clientBalance)
+	require.NoError(t, err, "Failed to create client balance")
+
+	// Destination balance starting at 0
+	destinationBalance := &model.Balance{
+		BalanceID: model.GenerateUUIDWithSuffix("dest"),
+		Currency:  "GBP",
+		LedgerID:  "general_ledger_id",
+	}
+	destBalance, err := ds.CreateBalance(*destinationBalance)
+	require.NoError(t, err, "Failed to create destination balance")
+
+	// Fund the balances by directly updating them in the database
+	// This simulates having pre-existing balances without needing source transactions
+	pmBalance.Balance = big.NewInt(15000)      // 150 GBP
+	pmBalance.CreditBalance = big.NewInt(15000)
+	pmBalance.DebitBalance = big.NewInt(0)
+	err = ds.UpdateBalance(&pmBalance)
+	require.NoError(t, err, "Failed to fund payment methods balance")
+
+	clBalance.Balance = big.NewInt(20000)      // 200 GBP
+	clBalance.CreditBalance = big.NewInt(20000)
+	clBalance.DebitBalance = big.NewInt(0)
+	err = ds.UpdateBalance(&clBalance)
+	require.NoError(t, err, "Failed to fund client balance")
+
+	t.Logf("Created test balances:")
+	t.Logf("  Payment Methods Balance ID: %s (funded with 150 GBP)", pmBalance.BalanceID)
+	t.Logf("  Client Balance ID: %s (funded with 200 GBP)", clBalance.BalanceID)
+	t.Logf("  Destination Balance ID: %s (starting at 0)", destBalance.BalanceID)
+	t.Log("")
+
+	// Record initial balance states
+	initialPM, err := ds.GetBalanceByIDLite(pmBalance.BalanceID)
+	require.NoError(t, err)
+	initialClient, err := ds.GetBalanceByIDLite(clBalance.BalanceID)
+	require.NoError(t, err)
+	initialDest, err := ds.GetBalanceByIDLite(destBalance.BalanceID)
+	require.NoError(t, err)
+
+	t.Logf("Initial balance states:")
+	t.Logf("  Payment Methods: %s GBP", initialPM.Balance.String())
+	t.Logf("  Client: %s GBP", initialClient.Balance.String())
+	t.Logf("  Destination: %s GBP", initialDest.Balance.String())
+	t.Log("")
+
+	// Create bulk transaction request matching the exact issue scenario
+	batchRef := "res_adam-testing-clientBal-01"
+	firstTxnRef := batchRef + " - " + model.GenerateUUIDWithSuffix("test") + " - deposit-pm"
+	secondTxnRef := batchRef + " - " + model.GenerateUUIDWithSuffix("test") + " - deposit-client"
+
+	bulkRequest := &model.BulkTransactionRequest{
+		Atomic:    true,  // This is the key - atomic should rollback everything on failure
+		Inflight:  false, // Process immediately
+		RunAsync:  false, // Synchronous for easier testing
+		SkipQueue: true,  // Process directly
+		Transactions: []*model.Transaction{
+			{
+				// Transaction 1: Payment methods to destination - 100 GBP (should succeed)
+				Amount:         100,
+				Reference:      firstTxnRef,
+				Currency:       "GBP",
+				Precision:      100,
+				Source:         pmBalance.BalanceID,
+				Destination:    destBalance.BalanceID,
+				Description:    "Reservation deposit (payment methods) for reference " + batchRef,
+				AllowOverdraft: true, // This transaction allows overdraft
+			},
+			{
+				// Transaction 2: Client balance to destination - 300 GBP (should fail due to insufficient funds)
+				Amount:         300,
+				Reference:      secondTxnRef,
+				Currency:       "GBP",
+				Precision:      100,
+				Source:         clBalance.BalanceID,
+				Destination:    destBalance.BalanceID,
+				Description:    "Reservation deposit (client balance) for reference " + batchRef,
+				AllowOverdraft: false, // This transaction does NOT allow overdraft
+			},
+		},
+	}
+
+	t.Log("Executing atomic bulk transaction:")
+	t.Log("Transaction 1: 100 GBP from payment methods (allow_overdraft=true)")
+	t.Log("Transaction 2: 300 GBP from client balance (allow_overdraft=false)")
+	t.Log("Expected: Transaction 2 should fail, causing atomic rollback of Transaction 1")
+	t.Log("")
+
+	// Execute bulk transaction
+	result, err := blnk.CreateBulkTransactions(ctx, bulkRequest)
+
+	// Verify that the bulk transaction failed (as expected due to insufficient funds in second transaction)
+	require.Error(t, err, "Bulk transaction should fail due to insufficient funds in second transaction")
+	require.NotNil(t, result, "Result should not be nil even on failure")
+	require.Equal(t, "failed", result.Status, "Bulk transaction status should be 'failed'")
+	require.Contains(t, result.Error, "insufficient funds", "Error should mention insufficient funds")
+
+	t.Logf("Bulk transaction failed as expected: %s", result.Error)
+	t.Log("")
+
+	// Now check the balance states to see if the bug exists
+	finalPM, err := ds.GetBalanceByIDLite(pmBalance.BalanceID)
+	require.NoError(t, err)
+	finalClient, err := ds.GetBalanceByIDLite(clBalance.BalanceID)
+	require.NoError(t, err)
+	finalDest, err := ds.GetBalanceByIDLite(destBalance.BalanceID)
+	require.NoError(t, err)
+
+	t.Logf("Final balance states:")
+	t.Logf("  Payment Methods: %s GBP", finalPM.Balance.String())
+	t.Logf("  Client: %s GBP", finalClient.Balance.String())
+	t.Logf("  Destination: %s GBP", finalDest.Balance.String())
+	t.Log("")
+
+	// The bug test: Check if destination balance was incorrectly updated
+	// With atomic=true, ALL transactions should be rolled back, so destination should remain 0
+	if finalDest.Balance.Cmp(initialDest.Balance) != 0 {
+		t.Errorf("BUG DETECTED: Destination balance was updated despite atomic rollback!")
+		t.Errorf("  Expected destination balance: %s GBP", initialDest.Balance.String())
+		t.Errorf("  Actual destination balance: %s GBP", finalDest.Balance.String())
+		t.Errorf("  This indicates the first transaction (100 GBP) was not properly rolled back")
+		t.Log("")
+		t.Log("This confirms the atomic bulk transaction bug described in the issue:")
+		t.Log("- Despite atomic=true and the error message saying 'All transactions have been refunded'")
+		t.Log("- The destination balance was still updated by the first transaction")
+		t.Log("- The rollback mechanism failed to revert the destination balance changes")
+	} else {
+		t.Log("SUCCESS: Destination balance correctly remained unchanged after atomic rollback")
+		t.Log("This suggests the atomic bulk transaction bug has been fixed")
+	}
+
+	// Additional verification: Payment methods balance should also be unchanged
+	if finalPM.Balance.Cmp(initialPM.Balance) != 0 {
+		t.Errorf("ADDITIONAL BUG: Payment methods balance was not properly rolled back!")
+		t.Errorf("  Expected PM balance: %s GBP", initialPM.Balance.String())
+		t.Errorf("  Actual PM balance: %s GBP", finalPM.Balance.String())
+	}
+
+	// Client balance should be unchanged since its transaction failed
+	if finalClient.Balance.Cmp(initialClient.Balance) != 0 {
+		t.Errorf("UNEXPECTED: Client balance was changed despite transaction failure!")
+		t.Errorf("  Expected client balance: %s GBP", initialClient.Balance.String())
+		t.Errorf("  Actual client balance: %s GBP", finalClient.Balance.String())
+	}
+
+	t.Log("")
+	t.Log("Test Analysis:")
+	t.Log("This test reproduces the exact atomic bulk transaction bug scenario.")
+	t.Log("If the destination balance is updated despite the atomic rollback failure,")
+	t.Log("it confirms the bug exists in the transaction processing logic.")
+	t.Log("")
+	t.Log("Key areas to investigate if bug is present:")
+	t.Log("1. transaction.go:processBulkTransactions() - sequential processing issue")
+	t.Log("2. transaction.go:rollbackBatchTransactions() - incomplete rollback")
+	t.Log("3. database/balance.go:UpdateBalances() - transaction handling")
+	t.Log("4. Database transaction isolation and commit timing")
+}

@@ -2052,6 +2052,80 @@ func (l *Blnk) processBulkTransactions(ctx context.Context, transactions []*mode
 	return nil
 }
 
+// processAtomicBulkTransactions processes transactions atomically within a single database transaction
+func (l *Blnk) processAtomicBulkTransactions(ctx context.Context, transactions []*model.Transaction, batchID string, inflight bool, skipQueue bool) error {
+	ctx, span := tracer.Start(ctx, "ProcessAtomicBulkTransactions")
+	defer span.End()
+
+	// For atomic transactions, we'll process all transactions within their individual validations
+	// but accumulate all balance changes and perform them in a single atomic operation.
+	
+	// First, validate all transactions and collect balance changes
+	var sourceBalances []*model.Balance
+	var destinationBalances []*model.Balance
+	var validatedTransactions []*model.Transaction
+
+	for i, txn := range transactions {
+		// Set transaction properties
+		txn.Inflight = inflight
+		txn.SkipQueue = true // Always skip queue for atomic processing
+		txn.ParentTransaction = batchID
+		txn.Atomic = true // Mark as atomic
+
+		// Add sequence number to metadata
+		if txn.MetaData == nil {
+			txn.MetaData = make(map[string]interface{})
+		}
+		txn.MetaData["sequence"] = i + 1
+
+		// Validate the transaction
+		if err := l.validateTxn(ctx, txn); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to validate atomic transaction %d (Reference: %s): %w", i+1, txn.Reference, err)
+		}
+
+		// Retrieve the source and destination balances
+		sourceBalance, destinationBalance, err := l.getSourceAndDestination(ctx, txn)
+		if err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to get balances for atomic transaction %d (Reference: %s): %w", i+1, txn.Reference, err)
+		}
+
+		// Update transaction with balance IDs
+		txn.Source = sourceBalance.BalanceID
+		txn.Destination = destinationBalance.BalanceID
+
+		// Apply the transaction to the balances (this modifies the balance objects)
+		if err := l.applyTransactionToBalances(ctx, []*model.Balance{sourceBalance, destinationBalance}, txn); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to apply atomic transaction %d (Reference: %s, Source: %s, Destination: %s, Amount: %.2f): %w",
+				i+1, txn.Reference, txn.Source, txn.Destination, txn.Amount, err)
+		}
+
+		// Update transaction details
+		txn = l.updateTransactionDetails(ctx, txn, sourceBalance, destinationBalance)
+
+		// Collect the updated balances and transactions for atomic processing
+		sourceBalances = append(sourceBalances, sourceBalance)
+		destinationBalances = append(destinationBalances, destinationBalance)
+		validatedTransactions = append(validatedTransactions, txn)
+	}
+
+	// Now perform atomic updates of all balances and transactions
+	if err := l.atomicUpdateAllBalancesAndTransactions(ctx, sourceBalances, destinationBalances, validatedTransactions); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to atomically update balances and transactions: %w", err)
+	}
+
+	// Perform post-transaction actions for all transactions
+	for _, txn := range validatedTransactions {
+		l.postTransactionActions(ctx, txn)
+	}
+
+	span.AddEvent("Atomic bulk transaction completed successfully")
+	return nil
+}
+
 // rollbackBatchTransactions performs a rollback of transactions in a batch
 // Returns the action performed (voided/refunded) and any error that occurred
 func (l *Blnk) rollbackBatchTransactions(ctx context.Context, batchID string, isInflight bool) (string, error) {
@@ -2182,8 +2256,15 @@ func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransa
 			logrus.Infof("Starting async bulk transaction batch %s with %d transactions (atomic: %v, inflight: %v)",
 				batchID, len(req.Transactions), req.Atomic, req.Inflight)
 
-			// Process transactions in batch
-			err := l.processBulkTransactions(bgCtx, req.Transactions, batchID, req.Inflight, req.SkipQueue)
+			// Process transactions in batch - use atomic processing if atomic=true
+			var err error
+			if req.Atomic && req.SkipQueue {
+				// Use atomic transaction processing for true atomicity
+				err = l.processAtomicBulkTransactions(bgCtx, req.Transactions, batchID, req.Inflight, req.SkipQueue)
+			} else {
+				// Use regular processing (existing behavior)
+				err = l.processBulkTransactions(bgCtx, req.Transactions, batchID, req.Inflight, req.SkipQueue)
+			}
 
 			if err != nil {
 				// Handle failure (rollback if atomic, send webhook)
@@ -2210,8 +2291,17 @@ func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransa
 	logrus.Infof("Starting sync bulk transaction batch %s with %d transactions (atomic: %v, inflight: %v)",
 		batchID, len(req.Transactions), req.Atomic, req.Inflight)
 
-	// Process transactions in batch
-	if err := l.processBulkTransactions(ctx, req.Transactions, batchID, req.Inflight, req.SkipQueue); err != nil {
+	// Process transactions in batch - use atomic processing if atomic=true
+	var err error
+	if req.Atomic && req.SkipQueue {
+		// Use atomic transaction processing for true atomicity
+		err = l.processAtomicBulkTransactions(ctx, req.Transactions, batchID, req.Inflight, req.SkipQueue)
+	} else {
+		// Use regular processing (existing behavior)
+		err = l.processBulkTransactions(ctx, req.Transactions, batchID, req.Inflight, req.SkipQueue)
+	}
+
+	if err != nil {
 		span.RecordError(err)
 		logrus.Errorf("Sync bulk transaction error for batch %s: %s", batchID, err.Error())
 
@@ -2248,3 +2338,62 @@ func (l *Blnk) CreateBulkTransactions(ctx context.Context, req *model.BulkTransa
 		TransactionCount: len(req.Transactions),
 	}, nil
 }
+
+
+// atomicUpdateAllBalancesAndTransactions performs atomic updates of all balances and transactions
+func (l *Blnk) atomicUpdateAllBalancesAndTransactions(ctx context.Context, sourceBalances, destinationBalances []*model.Balance, transactions []*model.Transaction) error {
+	ctx, span := tracer.Start(ctx, "AtomicUpdateAllBalancesAndTransactions")
+	defer span.End()
+
+	// Begin a database transaction for truly atomic updates
+	tx, err := l.datasource.BeginAtomicTx(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to begin atomic update transaction: %w", err)
+	}
+
+	// Ensure rollback on any error
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		} else if err != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Update all balances within the transaction
+	for i, sourceBalance := range sourceBalances {
+		destinationBalance := destinationBalances[i]
+		
+		// Update source balance
+		if err = tx.UpdateBalance(ctx, sourceBalance); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to update source balance %s in atomic transaction: %w", sourceBalance.BalanceID, err)
+		}
+
+		// Update destination balance
+		if err = tx.UpdateBalance(ctx, destinationBalance); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to update destination balance %s in atomic transaction: %w", destinationBalance.BalanceID, err)
+		}
+	}
+
+	// Persist all transactions within the transaction
+	for _, txn := range transactions {
+		if err = tx.PersistTransaction(ctx, txn); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to persist transaction %s in atomic transaction: %w", txn.TransactionID, err)
+		}
+	}
+
+	// Commit the transaction if all updates succeeded
+	if err = tx.Commit(); err != nil {
+		span.RecordError(err)
+		return fmt.Errorf("failed to commit atomic update transaction: %w", err)
+	}
+
+	span.AddEvent("All balances and transactions updated atomically")
+	return nil
+}
+

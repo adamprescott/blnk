@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/jerry-enebeli/blnk/database"
 	"github.com/jerry-enebeli/blnk/model"
 	"github.com/stretchr/testify/mock"
 )
@@ -406,5 +407,35 @@ func (m *MockDataSource) IsTransactionRefunded(ctx context.Context, transaction 
 
 func (m *MockDataSource) UpdateBalanceIdentity(balanceID string, identityID string) error {
 	args := m.Called(balanceID, identityID)
+	return args.Error(0)
+}
+
+func (m *MockDataSource) BeginAtomicTx(ctx context.Context) (database.AtomicTransaction, error) {
+	args := m.Called(ctx)
+	return args.Get(0).(database.AtomicTransaction), args.Error(1)
+}
+
+// MockAtomicTransaction is a mock implementation of the AtomicTransaction interface
+type MockAtomicTransaction struct {
+	mock.Mock
+}
+
+func (m *MockAtomicTransaction) UpdateBalance(ctx context.Context, balance *model.Balance) error {
+	args := m.Called(ctx, balance)
+	return args.Error(0)
+}
+
+func (m *MockAtomicTransaction) PersistTransaction(ctx context.Context, txn *model.Transaction) error {
+	args := m.Called(ctx, txn)
+	return args.Error(0)
+}
+
+func (m *MockAtomicTransaction) Commit() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *MockAtomicTransaction) Rollback() error {
+	args := m.Called()
 	return args.Error(0)
 }
