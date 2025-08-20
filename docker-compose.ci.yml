@@ -1,0 +1,24 @@
+services:
+  redis:
+    image: redis:7.4.4
+    container_name: redis
+    ports:
+      - "6379:6379"
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: on-failure
+    ports:
+      - "5432:5432"
+    environment:
+      TZ: Etc/UTC
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: blnk
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "blnk", "-d", "blnk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
